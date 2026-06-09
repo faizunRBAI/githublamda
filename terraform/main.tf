@@ -108,10 +108,8 @@ resource "null_resource" "create_dummy_zip" {
 
   provisioner "local-exec" {
     command = <<EOT
-if [ ! -f "${local.dummy_zip}" ]; then
-  echo 'handler = lambda event, context: {"statusCode": 200}' > /tmp/dummy_lambda_placeholder.py
-  zip -j "${local.dummy_zip}" /tmp/dummy_lambda_placeholder.py
-fi
+echo 'handler = lambda event, context: {"statusCode": 200}' > /tmp/dummy_lambda_placeholder.py
+zip -j "${local.dummy_zip}" /tmp/dummy_lambda_placeholder.py
 EOT
   }
 }
@@ -122,11 +120,11 @@ resource "aws_lambda_function" "app" {
   role          = aws_iam_role.lambda_exec.arn
   handler       = "app.main.handler"
   runtime       = "python${var.python_version}"
-  filename      = fileexists(var.lambda_zip_path) ? var.lambda_zip_path : local.dummy_zip
+  filename      = local.dummy_zip
   timeout       = var.lambda_timeout
   memory_size   = var.lambda_memory_size
 
-  source_code_hash = fileexists(var.lambda_zip_path) ? filebase64sha256(var.lambda_zip_path) : fileexists(local.dummy_zip) ? filebase64sha256(local.dummy_zip) : null
+  source_code_hash = filebase64sha256(local.dummy_zip)
 
   environment {
     variables = merge(
@@ -199,21 +197,38 @@ resource "aws_apigatewayv2_stage" "default" {
 
   access_log_settings {
     destination_arn = aws_cloudwatch_log_group.api_gw_logs.arn
-    format = jsonencode({
-      requestId      = "$context.requestId"
-      sourceIp       = "$context.identity.sourceIp"
-      requestTime    = "$context.requestTime"
-      protocol       = "$context.protocol"
-      httpMethod     = "$context.httpMethod"
-      resourcePath   = "$context.resourcePath"
-      routeKey       = "$context.routeKey"
-      status         = "$context.status"
-      responseLength = "$context.responseLength"
-      integrationError = "$context.integrationErrorMessage"
-    })
   }
+}
 
-  tags = {
-    Project = var.project_name
-  }
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.app.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "default_route" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "$default"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_lambda_permission" "api_gw" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.app.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
+}
+
+output "function_name" {
+  value = aws_lambda_function.app.function_name
+}
+
+output "api_url" {
+  value = aws_apigatewayv2_stage.default.invoke_url
+}
+
+output "function_url" {
+  value = aws_lambda_function_url.app_url.function_url
 }
