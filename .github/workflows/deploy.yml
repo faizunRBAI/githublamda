@@ -1,0 +1,333 @@
+name: Deploy Python to Lambda
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision Lambda Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      function_name: ${{ steps.tf_outputs.outputs.function_name }}
+      api_url: ${{ steps.tf_outputs.outputs.api_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Write Terraform configuration
+        run: |
+          mkdir -p terraform
+          cat > terraform/main.tf << 'TFEOF'
+          terraform {
+            required_providers {
+              aws = {
+                source  = "hashicorp/aws"
+                version = "< 5.83.0"
+              }
+            }
+            backend "s3" {}
+          }
+
+          provider "aws" {
+            region = "us-east-1"
+          }
+
+          variable "project_name" {
+            type = string
+          }
+
+          variable "python_version" {
+            type    = string
+            default = "python3.11"
+          }
+
+          resource "aws_iam_role" "lambda_exec" {
+            name = "${var.project_name}-lambda-exec"
+
+            assume_role_policy = jsonencode({
+              Version = "2012-10-17"
+              Statement = [
+                {
+                  Action = "sts:AssumeRole"
+                  Effect = "Allow"
+                  Principal = {
+                    Service = "lambda.amazonaws.com"
+                  }
+                }
+              ]
+            })
+
+            lifecycle {
+              ignore_changes = [name]
+            }
+          }
+
+          resource "aws_iam_role_policy_attachment" "lambda_basic" {
+            role       = aws_iam_role.lambda_exec.name
+            policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          }
+
+          resource "aws_lambda_function" "app" {
+            function_name = "${var.project_name}-app"
+            role          = aws_iam_role.lambda_exec.arn
+            handler       = "mangum_handler.handler"
+            runtime       = var.python_version
+            filename      = "${path.module}/lambda_package.zip"
+            timeout       = 30
+            memory_size   = 256
+
+            environment {
+              variables = {
+                APP_ENV = "production"
+              }
+            }
+
+            lifecycle {
+              ignore_changes = [filename]
+            }
+          }
+
+          resource "aws_apigatewayv2_api" "http_api" {
+            name          = "${var.project_name}-api"
+            protocol_type = "HTTP"
+          }
+
+          resource "aws_apigatewayv2_integration" "lambda_integration" {
+            api_id             = aws_apigatewayv2_api.http_api.id
+            integration_type   = "AWS_PROXY"
+            integration_uri    = aws_lambda_function.app.invoke_arn
+            integration_method = "POST"
+          }
+
+          resource "aws_apigatewayv2_route" "default_route" {
+            api_id    = aws_apigatewayv2_api.http_api.id
+            route_key = "$default"
+            target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+          }
+
+          resource "aws_apigatewayv2_stage" "default_stage" {
+            api_id      = aws_apigatewayv2_api.http_api.id
+            name        = "$default"
+            auto_deploy = true
+          }
+
+          resource "aws_lambda_permission" "apigw_invoke" {
+            statement_id  = "AllowAPIGatewayInvoke"
+            action        = "lambda:InvokeFunction"
+            function_name = aws_lambda_function.app.function_name
+            principal     = "apigateway.amazonaws.com"
+            source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
+          }
+
+          output "function_name" {
+            value = aws_lambda_function.app.function_name
+          }
+
+          output "api_url" {
+            value = aws_apigatewayv2_api.http_api.api_endpoint
+          }
+          TFEOF
+
+      - name: Create placeholder zip for Terraform
+        run: |
+          mkdir -p terraform
+          echo "placeholder" > /tmp/placeholder.py
+          zip terraform/lambda_package.zip /tmp/placeholder.py -j
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=us-east-1" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}"
+
+      - name: Capture Terraform outputs
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          echo "function_name=$(terraform output -raw function_name)" >> "$GITHUB_OUTPUT"
+          echo "api_url=$(terraform output -raw api_url)" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Package and Deploy to Lambda
+    runs-on: ubuntu-latest
+    needs: provision
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Install dependencies into package directory
+        run: |
+          mkdir -p package
+          pip install \
+            --target ./package \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            -r requirements.txt
+          pip install \
+            --target ./package \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            mangum
+
+      - name: Write Mangum handler
+        run: |
+          cat > mangum_handler.py << 'PYEOF'
+          from mangum import Mangum
+          from app.main import app
+
+          handler = Mangum(app, lifespan="off")
+          PYEOF
+
+      - name: Build Lambda deployment package
+        run: |
+          cd package
+          zip -r9 ../lambda_package.zip .
+          cd ..
+          zip -g lambda_package.zip mangum_handler.py
+          find app -name "*.py" | while read f; do
+            zip -g lambda_package.zip "$f"
+          done
+          if [ -d "public" ]; then
+            find public -type f | while read f; do
+              zip -g lambda_package.zip "$f"
+            done
+          fi
+
+      - name: Update Lambda function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ needs.provision.outputs.function_name }}" \
+            --zip-file fileb://lambda_package.zip \
+            --region us-east-1
+
+      - name: Wait for Lambda update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name "${{ needs.provision.outputs.function_name }}" \
+            --region us-east-1
+
+      - name: Update Lambda environment variables
+        run: |
+          aws lambda update-function-configuration \
+            --function-name "${{ needs.provision.outputs.function_name }}" \
+            --environment "Variables={APP_ENV=production}" \
+            --region us-east-1
+
+      - name: Wait for configuration update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name "${{ needs.provision.outputs.function_name }}" \
+            --region us-east-1
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+
+    steps:
+      - name: Wait for API Gateway propagation
+        run: sleep 15
+
+      - name: Health check via API Gateway
+        run: |
+          API_URL="${{ needs.provision.outputs.api_url }}"
+          echo "Checking health at: ${API_URL}/health"
+          MAX_RETRIES=10
+          COUNT=0
+          until curl -sf --max-time 15 "${API_URL}/health"; do
+            COUNT=$((COUNT + 1))
+            if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
+              echo "Health check failed after ${MAX_RETRIES} attempts"
+              exit 1
+            fi
+            echo "Attempt ${COUNT} failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check passed"
+
+      - name: Verify API info endpoint
+        run: |
+          API_URL="${{ needs.provision.outputs.api_url }}"
+          echo "Checking API info at: ${API_URL}/api/info"
+          curl -sf --max-time 15 "${API_URL}/api/info" || echo "API info endpoint check completed"
+
+  notify:
+    name: Notify Deployment Result
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+
+    steps:
+      - name: Deployment success summary
+        if: needs.verify.result == 'success'
+        run: |
+          echo "=========================================="
+          echo " Deployment successful!"
+          echo "=========================================="
+          echo " Project   : ${{ secrets.PROJECT_NAME }}"
+          echo " Function  : ${{ needs.provision.outputs.function_name }}"
+          echo " API URL   : ${{ needs.provision.outputs.api_url }}"
+          echo " Health    : ${{ needs.provision.outputs.api_url }}/health"
+          echo " Region    : us-east-1"
+          echo "=========================================="
+
+      - name: Deployment failure summary
+        if: needs.verify.result != 'success'
+        run: |
+          echo "=========================================="
+          echo " Deployment FAILED"
+          echo "=========================================="
+          echo " Project   : ${{ secrets.PROJECT_NAME }}"
+          echo " Function  : ${{ needs.provision.outputs.function_name }}"
+          echo " Region    : us-east-1"
+          echo " Check CloudWatch logs for details"
+          echo "=========================================="
+          exit 1
