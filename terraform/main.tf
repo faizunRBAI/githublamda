@@ -102,7 +102,7 @@ resource "aws_lambda_function" "app" {
   function_name = "${var.project_name}-function"
   role          = aws_iam_role.lambda_exec.arn
   handler       = "app.main.handler"
-  runtime       = var.python_version
+  runtime       = "python${var.python_version}"
   filename      = var.lambda_zip_path
   timeout       = var.lambda_timeout
   memory_size   = var.lambda_memory_size
