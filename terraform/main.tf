@@ -97,17 +97,36 @@ resource "aws_cloudwatch_log_group" "lambda_logs" {
   }
 }
 
+locals {
+  dummy_zip = "${path.module}/dummy_lambda.zip"
+}
+
+resource "null_resource" "create_dummy_zip" {
+  triggers = {
+    always = timestamp()
+  }
+
+  provisioner "local-exec" {
+    command = <<EOT
+if [ ! -f "${local.dummy_zip}" ]; then
+  echo 'handler = lambda event, context: {"statusCode": 200}' > /tmp/dummy_lambda_placeholder.py
+  zip -j "${local.dummy_zip}" /tmp/dummy_lambda_placeholder.py
+fi
+EOT
+  }
+}
+
 # Lambda Function
 resource "aws_lambda_function" "app" {
   function_name = "${var.project_name}-function"
   role          = aws_iam_role.lambda_exec.arn
   handler       = "app.main.handler"
   runtime       = "python${var.python_version}"
-  filename      = var.lambda_zip_path
+  filename      = fileexists(var.lambda_zip_path) ? var.lambda_zip_path : local.dummy_zip
   timeout       = var.lambda_timeout
   memory_size   = var.lambda_memory_size
 
-  source_code_hash = fileexists(var.lambda_zip_path) ? filebase64sha256(var.lambda_zip_path) : null
+  source_code_hash = fileexists(var.lambda_zip_path) ? filebase64sha256(var.lambda_zip_path) : fileexists(local.dummy_zip) ? filebase64sha256(local.dummy_zip) : null
 
   environment {
     variables = merge(
@@ -124,6 +143,7 @@ resource "aws_lambda_function" "app" {
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic,
     aws_cloudwatch_log_group.lambda_logs,
+    null_resource.create_dummy_zip,
   ]
 
   tags = {
