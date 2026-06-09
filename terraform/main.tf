@@ -107,7 +107,7 @@ resource "aws_lambda_function" "app" {
   timeout       = var.lambda_timeout
   memory_size   = var.lambda_memory_size
 
-  source_code_hash = filebase64sha256(var.lambda_zip_path)
+  source_code_hash = fileexists(var.lambda_zip_path) ? filebase64sha256(var.lambda_zip_path) : null
 
   environment {
     variables = merge(
@@ -196,37 +196,4 @@ resource "aws_apigatewayv2_stage" "default" {
   tags = {
     Project = var.project_name
   }
-}
-
-resource "aws_apigatewayv2_integration" "lambda_integration" {
-  api_id                 = aws_apigatewayv2_api.http_api.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.app.invoke_arn
-  payload_format_version = "2.0"
-}
-
-resource "aws_apigatewayv2_route" "default_route" {
-  api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "$default"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
-}
-
-resource "aws_lambda_permission" "api_gw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.app.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
-}
-
-output "function_name" {
-  value = aws_lambda_function.app.function_name
-}
-
-output "api_url" {
-  value = aws_apigatewayv2_api.http_api.api_endpoint
-}
-
-output "function_url" {
-  value = aws_lambda_function_url.app_url.function_url
 }
