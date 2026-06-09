@@ -1,6 +1,3 @@
-terraform/main.tf
-
-```hcl
 terraform {
   required_providers {
     aws = {
@@ -21,10 +18,22 @@ variable "project_name" {
   default     = "githublamda"
 }
 
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
+}
+
 variable "python_version" {
   description = "Python runtime version"
   type        = string
   default     = "python3.11"
+}
+
+variable "lambda_handler" {
+  description = "Lambda handler"
+  type        = string
+  default     = "app.main.handler"
 }
 
 variable "lambda_zip_path" {
@@ -154,6 +163,15 @@ resource "aws_apigatewayv2_api" "http_api" {
   }
 }
 
+resource "aws_cloudwatch_log_group" "api_gw_logs" {
+  name              = "/aws/api_gw/${var.project_name}-http-api"
+  retention_in_days = 14
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.http_api.id
   name        = "$default"
@@ -174,15 +192,6 @@ resource "aws_apigatewayv2_stage" "default" {
       integrationError = "$context.integrationErrorMessage"
     })
   }
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-resource "aws_cloudwatch_log_group" "api_gw_logs" {
-  name              = "/aws/api_gw/${var.project_name}-http-api"
-  retention_in_days = 14
 
   tags = {
     Project = var.project_name
@@ -210,27 +219,14 @@ resource "aws_lambda_permission" "api_gw" {
   source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
 }
 
-output "lambda_function_name" {
-  description = "Name of the Lambda function"
-  value       = aws_lambda_function.app.function_name
+output "function_name" {
+  value = aws_lambda_function.app.function_name
 }
 
-output "lambda_function_arn" {
-  description = "ARN of the Lambda function"
-  value       = aws_lambda_function.app.arn
+output "api_url" {
+  value = aws_apigatewayv2_api.http_api.api_endpoint
 }
 
-output "lambda_function_url" {
-  description = "Lambda Function URL"
-  value       = aws_lambda_function_url.app_url.function_url
-}
-
-output "api_gateway_url" {
-  description = "API Gateway HTTP endpoint URL"
-  value       = aws_apigatewayv2_stage.default.invoke_url
-}
-
-output "health_check_url" {
-  description = "Health check endpoint URL"
-  value       = "${aws_apigatewayv2_stage.default.invoke_url}/health"
+output "function_url" {
+  value = aws_lambda_function_url.app_url.function_url
 }
